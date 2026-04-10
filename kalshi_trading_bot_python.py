@@ -40,7 +40,7 @@ def _load_config() -> dict:
 _cfg = _load_config()
 
 API_KEY      = os.environ.get("KALSHI_API_KEY", "")
-BASE_URL     = "https://trading-api.kalshi.com/trade-api/v2"
+BASE_URL     = "https://api.elections.kalshi.com/"
 PAPER        = _cfg.get("paper_trade",  True)
 TRADE_SIZE   = _cfg.get("trade_size",   1)
 MAX_TRADES   = _cfg.get("max_trades",   5)
