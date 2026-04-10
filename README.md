@@ -1,0 +1,2 @@
+# kalshi-trading
+AI Trading
