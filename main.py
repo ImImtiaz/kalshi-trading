@@ -9,13 +9,17 @@ Setup:
   3. python main.py
 
 Config (config.json):
-  paper_trade   — true = simulate only, no real orders
-  trade_size    — contracts per order
-  max_trades    — max simultaneous open positions
-  stop_loss     — exit loss threshold (dollars per contract, e.g. 0.07 = 7¢)
-  take_profit   — exit profit threshold (dollars per contract, e.g. 0.10 = 10¢)
-  poll_seconds  — seconds between market scans
-  market_limit  — how many markets to scan per cycle
+  paper_trade      — true = simulate only, no real orders
+  trade_size       — contracts per order
+  max_trades       — max simultaneous open positions
+  stop_loss        — exit loss threshold (dollars per contract, e.g. 0.07 = 7¢)
+  take_profit      — exit profit threshold (dollars per contract, e.g. 0.10 = 10¢)
+  poll_seconds     — seconds between market scans
+  scan_pool        — how many markets to fetch from API each cycle (fetch more, filter down)
+  series_whitelist — optional list of series prefixes to trade, e.g. ["KXBTC","KXETH"]
+                     leave empty [] to allow all series
+  series_blacklist — series prefixes to always skip, e.g. ["KXMVESPORTS","KXMVECROSS"]
+  dead_miss_limit  — consecutive empty-book cycles before a market is silenced
 """
 
 # ── Imports ───────────────────────────────────────────────────────────────────
@@ -41,13 +45,16 @@ _cfg = _load_config()
 
 API_KEY      = os.environ.get("KALSHI_API_KEY", "")
 BASE_URL     = "https://api.elections.kalshi.com/trade-api/v2"
-PAPER        = _cfg.get("paper_trade",  True)
-TRADE_SIZE   = _cfg.get("trade_size",   1)
-MAX_TRADES   = _cfg.get("max_trades",   5)
-STOP_LOSS    = _cfg.get("stop_loss",    0.07)
-TAKE_PROFIT  = _cfg.get("take_profit",  0.10)
-POLL_SECS    = _cfg.get("poll_seconds", 5)
-MKT_LIMIT    = _cfg.get("market_limit", 5)
+PAPER        = _cfg.get("paper_trade",   True)
+TRADE_SIZE   = _cfg.get("trade_size",    1)
+MAX_TRADES   = _cfg.get("max_trades",    5)
+STOP_LOSS    = _cfg.get("stop_loss",     0.07)
+TAKE_PROFIT  = _cfg.get("take_profit",   0.10)
+POLL_SECS    = _cfg.get("poll_seconds",  5)
+SCAN_POOL    = _cfg.get("scan_pool",     25)
+WHITELIST    = [s.upper() for s in _cfg.get("series_whitelist", [])]
+BLACKLIST    = [s.upper() for s in _cfg.get("series_blacklist", [])]
+DEAD_LIMIT   = _cfg.get("dead_miss_limit", 3)
 
 if not API_KEY:
     raise EnvironmentError(
@@ -64,7 +71,7 @@ def _setup_logging() -> logging.Logger:
     os.makedirs("logs", exist_ok=True)
     fmt = "%(asctime)s [%(levelname)-8s] %(message)s"
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format=fmt,
         handlers=[
             logging.StreamHandler(),
@@ -122,7 +129,7 @@ def _post(url: str, body: dict) -> dict:
             time.sleep(1)
     return {}
 
-def get_markets(limit: int = 5) -> list[dict]:
+def get_markets(limit: int = 25) -> list[dict]:
     return _get(f"{BASE_URL}/markets", limit=limit, status="open").get("markets", [])
 
 def get_orderbook(ticker: str) -> dict:
@@ -130,15 +137,48 @@ def get_orderbook(ticker: str) -> dict:
 
 def place_order(ticker: str, side: str, price: int, size: int) -> dict:
     if PAPER:
-        log.info("[PAPER] %-6s %-30s @ %3d × %d", side.upper(), ticker, price, size)
+        log.info("[PAPER] %-6s %-44s @ %3d x%d", side.upper(), ticker, price, size)
         return {"paper": True, "ticker": ticker, "side": side, "price": price}
     body = {"ticker": ticker, "side": side, "price": price, "count": size,
             "type": "limit", "action": "buy"}
-    log.info("[LIVE]  %-6s %-30s @ %3d × %d", side.upper(), ticker, price, size)
+    log.info("[LIVE]  %-6s %-44s @ %3d x%d", side.upper(), ticker, price, size)
     return _post(f"{BASE_URL}/orders", body)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 4 · DATA ENGINE  (rolling 15-min price history)
+# SECTION 4 · MARKET FILTER  (whitelist / blacklist / dead-market suppression)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_miss_count:   dict[str, int] = defaultdict(int)
+_dead_markets: set[str]       = set()
+_dead_logged:  set[str]       = set()   # only log the silence message once per ticker
+
+
+def _is_allowed(ticker: str) -> bool:
+    t = ticker.upper()
+    if BLACKLIST and any(t.startswith(b) for b in BLACKLIST):
+        return False
+    if WHITELIST and not any(t.startswith(w) for w in WHITELIST):
+        return False
+    return True
+
+
+def _mark_miss(ticker: str) -> None:
+    _miss_count[ticker] += 1
+    if _miss_count[ticker] >= DEAD_LIMIT:
+        _dead_markets.add(ticker)
+        if ticker not in _dead_logged:
+            log.info("Silencing illiquid market after %d misses: %s", DEAD_LIMIT, ticker)
+            _dead_logged.add(ticker)
+
+
+def _mark_live(ticker: str) -> None:
+    if ticker in _dead_markets:
+        log.info("Market back online: %s", ticker)
+        _dead_markets.discard(ticker)
+    _miss_count[ticker] = 0
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 5 · DATA ENGINE  (rolling 15-min price history)
 # ═════════════════════════════════════════════════════════════════════════════
 
 _history: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
@@ -155,10 +195,10 @@ def prices(ticker: str) -> list[float]:
     return [p[1] for p in _history.get(ticker, [])]
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 5 · STRATEGIES
+# SECTION 6 · STRATEGIES
 # ═════════════════════════════════════════════════════════════════════════════
 
-_MIN_PTS = 5   # minimum history points required
+_MIN_PTS = 5
 
 def mean_reversion(ticker: str, mid: float) -> str | None:
     pts = prices(ticker)
@@ -177,7 +217,7 @@ def range_trade(ticker: str, mid: float) -> str | None:
     if len(pts) < _MIN_PTS:
         return None
     lo, hi = min(pts), max(pts)
-    if hi - lo < 5:           # range too narrow → skip (illiquid / stale)
+    if hi - lo < 5:
         return None
     if mid <= lo + 2:
         return "buy_yes"
@@ -201,15 +241,14 @@ def time_decay(ticker: str, mid: float, expiry: datetime) -> str | None:
     return None
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 6 · RISK MANAGER
+# SECTION 7 · RISK MANAGER
 # ═════════════════════════════════════════════════════════════════════════════
 
-# { ticker: {"side": str, "entry": float, "size": int} }
 _positions: dict[str, dict] = {}
 
 def _can_trade(ticker: str) -> bool:
     if ticker in _positions:
-        return False                             # already in this market
+        return False
     if len(_positions) >= MAX_TRADES:
         log.warning("Max positions (%d) reached — skipping %s", MAX_TRADES, ticker)
         return False
@@ -217,14 +256,13 @@ def _can_trade(ticker: str) -> bool:
 
 def _open(ticker: str, side: str, entry: float, size: int) -> None:
     _positions[ticker] = {"side": side, "entry": entry, "size": size}
-    log.info("Position opened › %s %s @ %.1f", ticker, side, entry)
+    log.info("Position opened › %s  %s @ %.1f", ticker, side, entry)
 
 def _close(ticker: str, reason: str) -> None:
     _positions.pop(ticker, None)
-    log.info("Position closed › %s [%s]", ticker, reason)
+    log.info("Position closed › %s  [%s]", ticker, reason)
 
 def check_exits(ticker: str, mid: float) -> bool:
-    """Returns True if a position was closed (skip re-entry this cycle)."""
     pos = _positions.get(ticker)
     if not pos:
         return False
@@ -239,16 +277,16 @@ def check_exits(ticker: str, mid: float) -> bool:
     return False
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 7 · EXECUTION
+# SECTION 8 · EXECUTION
 # ═════════════════════════════════════════════════════════════════════════════
 
 def execute(ticker: str, action: str, bid: float, ask: float, mid: float) -> None:
     if not _can_trade(ticker):
         return
     if action == "buy_yes":
-        side, price = "yes", int(round(ask))          # lift the ask
+        side, price = "yes", int(round(ask))
     elif action == "buy_no":
-        side, price = "no",  int(round(100 - bid))    # NO ask = 100 − YES bid
+        side, price = "no",  int(round(100 - bid))
     else:
         return
 
@@ -257,8 +295,6 @@ def execute(ticker: str, action: str, bid: float, ask: float, mid: float) -> Non
         return
 
     _open(ticker, side, mid, TRADE_SIZE)
-
-    # Append to trade log
     with open("logs/trades.log", "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now(timezone.utc).isoformat()} | {ticker} | {action} | "
@@ -266,7 +302,7 @@ def execute(ticker: str, action: str, bid: float, ask: float, mid: float) -> Non
         )
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 8 · MAIN LOOP
+# SECTION 9 · MAIN LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
 _running = True
@@ -294,23 +330,31 @@ def _mid_from_book(ob: dict) -> tuple[float, float, float] | None:
         return None
     bid, ask = bids[0][0], asks[0][0]
     if bid >= ask:
-        return None          # crossed or locked book — skip
+        return None
     return bid, ask, (bid + ask) / 2
 
 
 def main():
-    mode = "PAPER" if PAPER else "⚠ LIVE"
-    log.info("━" * 52)
-    log.info("  Kalshi Bot  |  mode=%-6s  |  max_pos=%d", mode, MAX_TRADES)
-    log.info("  stop_loss=%.2f  take_profit=%.2f  size=%d", STOP_LOSS, TAKE_PROFIT, TRADE_SIZE)
-    log.info("━" * 52)
+    mode = "PAPER" if PAPER else "LIVE"
+    log.info("━" * 60)
+    log.info("  Kalshi Bot  |  mode=%-8s |  max_pos=%d", mode, MAX_TRADES)
+    log.info("  stop_loss=%.2f  take_profit=%.2f  size=%d  pool=%d",
+             STOP_LOSS, TAKE_PROFIT, TRADE_SIZE, SCAN_POOL)
+    if WHITELIST:
+        log.info("  Whitelist: %s", WHITELIST)
+    if BLACKLIST:
+        log.info("  Blacklist: %s", BLACKLIST)
+    log.info("━" * 60)
 
+    cycle = 0
     while _running:
         try:
-            markets = get_markets(limit=MKT_LIMIT)
+            cycle += 1
+            markets = get_markets(limit=SCAN_POOL)
             if not markets:
                 log.warning("No open markets returned.")
 
+            active = 0
             for m in markets:
                 if not _running:
                     break
@@ -320,20 +364,29 @@ def main():
                 if not ticker or expiry is None:
                     continue
 
-                ob = get_orderbook(ticker)
-                book = _mid_from_book(ob)
-                if book is None:
-                    log.debug("No usable book for %s", ticker)
+                # Filter 1: whitelist / blacklist
+                if not _is_allowed(ticker):
                     continue
 
+                # Filter 2: skip silenced dead markets
+                if ticker in _dead_markets:
+                    continue
+
+                ob   = get_orderbook(ticker)
+                book = _mid_from_book(ob)
+
+                if book is None:
+                    _mark_miss(ticker)
+                    continue
+
+                _mark_live(ticker)
+                active += 1
                 bid, ask, mid = book
                 record_price(ticker, mid)
 
-                # Exit check before new entry
                 if check_exits(ticker, mid):
                     continue
 
-                # Strategy cascade (priority: time_decay → mean_reversion → range)
                 action = (
                     time_decay(ticker, mid, expiry)
                     or mean_reversion(ticker, mid)
@@ -345,12 +398,19 @@ def main():
                              action, ticker, mid, ask - bid)
                     execute(ticker, action, bid, ask, mid)
 
+            # Summary every ~1 minute
+            if cycle % 12 == 0:
+                log.info(
+                    "-- Cycle %d | scanned=%d active=%d silenced=%d positions=%d",
+                    cycle, len(markets), active, len(_dead_markets), len(_positions)
+                )
+
         except Exception:
             log.exception("Unhandled error — loop continues.")
 
         time.sleep(POLL_SECS)
 
-    log.info("Bot stopped cleanly. Open positions: %s", list(_positions.keys()) or "none")
+    log.info("Bot stopped. Open positions: %s", list(_positions.keys()) or "none")
 
 
 if __name__ == "__main__":
